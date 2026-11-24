@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/viper"
 	keyring "github.com/zalando/go-keyring"
 	"gopkg.in/square/go-jose.v2/jwt"
+	"gopkg.in/yaml.v3"
 )
 
 var ErrAccessTokenExpired = fmt.Errorf("accesstoken is expired")
@@ -402,24 +403,52 @@ func SaveConfig() error {
 		return err
 	}
 
-	if _, err := os.Stat(filepath.Join(home, configFolder)); os.IsNotExist(err) {
-		err = os.Mkdir(filepath.Join(home, configFolder), 0777)
+	folder := filepath.Join(home, configFolder)
+	if _, err := os.Stat(folder); os.IsNotExist(err) {
+		err = os.Mkdir(folder, 0777)
 		if err != nil {
 			log.Warn("failed to create %s folder for config. %v", configFolder, err)
 		}
 	}
 
-	err = viper.WriteConfig()
+	// AllSettings is the same value viper.WriteConfig marshals, so the file keeps its
+	// shape while the write itself becomes atomic.
+	data, err := yaml.Marshal(viper.AllSettings())
 	if err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			err = viper.SafeWriteConfig()
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
+		return err
 	}
+
+	return writeFileAtomically(filepath.Join(folder, "config.yaml"), data)
+}
+
+// writeFileAtomically writes the data to a temporary file in the same folder and renames
+// it over the target. A rename inside one folder is atomic, so parallel CLI invocations
+// either see the whole previous file or the whole new one, never a truncated one.
+func writeFileAtomically(target string, data []byte) error {
+	folder := filepath.Dir(target)
+
+	temp, err := os.CreateTemp(folder, "config-*.yaml.tmp")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		os.Remove(tempName)
+		return err
+	}
+
+	if err := temp.Close(); err != nil {
+		os.Remove(tempName)
+		return err
+	}
+
+	if err := os.Rename(tempName, target); err != nil {
+		os.Remove(tempName)
+		return err
+	}
+
 	return nil
 }
 
