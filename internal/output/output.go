@@ -43,7 +43,7 @@ func WriteFile(folderPath string, filePath string, data []byte) error {
 		}
 	}
 
-	file, err := os.OpenFile(path.Join(folderPath, filePath), os.O_CREATE|os.O_RDWR, 0777)
+	file, err := os.OpenFile(path.Join(folderPath, filePath), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0777)
 	if err != nil {
 		return err
 	}

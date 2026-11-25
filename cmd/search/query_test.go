@@ -63,3 +63,67 @@ func TestUsesExtendedFlagsOnlyReportsSetFlags(t *testing.T) {
 		t.Error("expected the default code path when no flag is set")
 	}
 }
+
+func TestValidateQueryFlagsRejectsNegativeLimitAndOffset(t *testing.T) {
+	cmd := newQueryCmd()
+	if err := cmd.Flags().Set("limit", "-1"); err != nil {
+		t.Fatalf("unable to set --limit: %v", err)
+	}
+	if err := validateQueryFlags(cmd, false, false, -1, 0); err == nil {
+		t.Error("expected an error for negative --limit")
+	}
+
+	cmd = newQueryCmd()
+	if err := cmd.Flags().Set("offset", "-5"); err != nil {
+		t.Fatalf("unable to set --offset: %v", err)
+	}
+	if err := validateQueryFlags(cmd, false, false, 0, -5); err == nil {
+		t.Error("expected an error for negative --offset")
+	}
+}
+
+func TestValidateQueryFlagsRejectsConflictingCombinations(t *testing.T) {
+	cmd := newQueryCmd()
+	if err := cmd.Flags().Set("page-all", "true"); err != nil {
+		t.Fatalf("unable to set --page-all: %v", err)
+	}
+	if err := cmd.Flags().Set("offset", "10"); err != nil {
+		t.Fatalf("unable to set --offset: %v", err)
+	}
+	if err := validateQueryFlags(cmd, false, true, 0, 10); err == nil {
+		t.Error("expected an error when combining --page-all with --offset")
+	}
+
+	for _, conflict := range []struct {
+		name  string
+		value string
+	}{
+		{"page-all", "true"},
+		{"limit", "10"},
+		{"offset", "5"},
+		{"file-name", "out"},
+	} {
+		cmd = newQueryCmd()
+		if err := cmd.Flags().Set("count", "true"); err != nil {
+			t.Fatalf("unable to set --count: %v", err)
+		}
+		if err := cmd.Flags().Set(conflict.name, conflict.value); err != nil {
+			t.Fatalf("unable to set --%s: %v", conflict.name, err)
+		}
+		if err := validateQueryFlags(cmd, true, conflict.name == "page-all", 10, 5); err == nil {
+			t.Errorf("expected an error when combining --count with --%s", conflict.name)
+		}
+	}
+
+	// --count with --stdout is harmless and allowed.
+	cmd = newQueryCmd()
+	if err := cmd.Flags().Set("count", "true"); err != nil {
+		t.Fatalf("unable to set --count: %v", err)
+	}
+	if err := cmd.Flags().Set("stdout", "true"); err != nil {
+		t.Fatalf("unable to set --stdout: %v", err)
+	}
+	if err := validateQueryFlags(cmd, true, false, 0, 0); err != nil {
+		t.Errorf("expected --count --stdout to be allowed, got %v", err)
+	}
+}

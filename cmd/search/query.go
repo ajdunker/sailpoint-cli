@@ -32,6 +32,9 @@ func newQueryCmd() *cobra.Command {
 		Aliases: []string{"que"},
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateQueryFlags(cmd, count, pageAll, limit, offset); err != nil {
+				return err
+			}
 
 			err := config.InitConfig()
 			if err != nil {
@@ -44,20 +47,15 @@ func newQueryCmd() *cobra.Command {
 			}
 
 			searchQuery = args[0]
-			// fmt.Println(searchQuery)
 
 			searchObj, err := search.BuildSearch(searchQuery, sort, indices)
 			if err != nil {
 				return err
 			}
 
-			// Both of these are no-ops when the flags are not set, so the request stays
-			// byte for byte identical to the previous behaviour.
+			// ApplyIncludes is a no-op when --includes is empty, so the request stays
+			// identical to the previous behaviour.
 			search.ApplyIncludes(&searchObj, includes)
-			if pageAll && len(sort) == 0 {
-				// searchAfter paging needs a stable sort field.
-				searchObj.Sort = []string{"id"}
-			}
 
 			log.Info("Performing Search", "Query", searchQuery, "Indices", indices)
 
@@ -82,16 +80,29 @@ func newQueryCmd() *cobra.Command {
 				return nil
 			}
 
+			opts := search.OutputOptions{
+				FileName: fileName,
+				ToStdout: toStdout,
+				Writer:   cmd.OutOrStdout(),
+			}
+
+			// When --includes is set, preserve raw documents so requested custom
+			// attributes are not dropped and omitted fields are not zero-filled.
+			if searchObj.QueryResultFilter != nil && len(searchObj.QueryResultFilter.GetIncludes()) > 0 {
+				rawEntries, err := runPagedRawSearch(cmd, apiClient, searchObj, pageAll, limit, offset)
+				if err != nil {
+					return err
+				}
+
+				return search.WriteRawResults(rawEntries, searchQuery, folderPath, opts)
+			}
+
 			formattedResponse, err := runPagedSearch(cmd, apiClient, searchObj, pageAll, limit, offset)
 			if err != nil {
 				return err
 			}
 
-			return search.WriteResults(formattedResponse, searchQuery, folderPath, search.OutputOptions{
-				FileName: fileName,
-				ToStdout: toStdout,
-				Writer:   cmd.OutOrStdout(),
-			})
+			return search.WriteResults(formattedResponse, searchQuery, folderPath, opts)
 		},
 	}
 
@@ -100,7 +111,7 @@ func newQueryCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&sort, "sort", []string{}, "The sort value for the api call (displayName, +id...)")
 	cmd.Flags().StringSliceVar(&includes, "includes", []string{}, "Comma separated list of fields to return, for example id,name,attributes.uid. Only those fields are returned instead of whole documents.")
 	cmd.Flags().StringVar(&fileName, "file-name", "", "Name to use for the result file, without extension. Defaults to a name derived from the query.")
-	cmd.Flags().Int32Var(&limit, "limit", 0, "Maximum number of results to return for this request. Defaults to 250 when set.")
+	cmd.Flags().Int32Var(&limit, "limit", 0, "Maximum number of results to return per request (defaults to 250 when --offset or --page-all is used).")
 	cmd.Flags().Int32Var(&offset, "offset", 0, "Position in the full result set to start from.")
 	cmd.Flags().BoolVar(&count, "count", false, "Print only the total number of matches to stdout and write no file.")
 	cmd.Flags().BoolVar(&pageAll, "page-all", false, "Follow searchAfter paging until the whole result set is retrieved, which is not limited to the first 10K records.")
@@ -108,6 +119,27 @@ func newQueryCmd() *cobra.Command {
 	cmd.MarkFlagRequired("indices")
 
 	return cmd
+}
+
+// validateQueryFlags rejects negative paging values and incompatible flag combinations.
+func validateQueryFlags(cmd *cobra.Command, count bool, pageAll bool, limit int32, offset int32) error {
+	if limit < 0 {
+		return fmt.Errorf("--limit must be 0 or greater, got %d", limit)
+	}
+	if offset < 0 {
+		return fmt.Errorf("--offset must be 0 or greater, got %d", offset)
+	}
+	if pageAll && cmd.Flags().Changed("offset") {
+		return fmt.Errorf("--page-all cannot be combined with --offset")
+	}
+	if count {
+		for _, name := range []string{"page-all", "limit", "offset", "file-name"} {
+			if cmd.Flags().Changed(name) {
+				return fmt.Errorf("--count cannot be combined with --%s", name)
+			}
+		}
+	}
+	return nil
 }
 
 // usesExtendedFlags reports whether any of the flags that select a new code path were set.
@@ -120,10 +152,10 @@ func usesExtendedFlags(cmd *cobra.Command) bool {
 	return false
 }
 
-// runPagedSearch retrieves the results for the extended flag combination.
+// runPagedSearch retrieves decoded results for the extended flag combination.
 func runPagedSearch(cmd *cobra.Command, apiClient *sailpoint.APIClient, searchObj sailpointsdk.Search, pageAll bool, limit int32, offset int32) (search.SearchResults, error) {
 	if pageAll {
-		results, total, err := search.PerformSearchAllPages(*apiClient, searchObj)
+		results, total, err := search.PerformSearchAllPagesWithLimit(*apiClient, searchObj, limit)
 		logTotal(total)
 		return results, err
 	}
@@ -135,6 +167,23 @@ func runPagedSearch(cmd *cobra.Command, apiClient *sailpoint.APIClient, searchOb
 	}
 
 	return search.PerformSearch(*apiClient, searchObj)
+}
+
+// runPagedRawSearch retrieves raw document maps for queries that use --includes.
+func runPagedRawSearch(cmd *cobra.Command, apiClient *sailpoint.APIClient, searchObj sailpointsdk.Search, pageAll bool, limit int32, offset int32) ([]map[string]interface{}, error) {
+	if pageAll {
+		results, total, err := search.PerformRawSearchAllPages(*apiClient, searchObj, limit)
+		logTotal(total)
+		return results, err
+	}
+
+	if cmd.Flags().Changed("limit") || cmd.Flags().Changed("offset") {
+		results, total, err := search.PerformRawSearchPage(*apiClient, searchObj, limit, offset)
+		logTotal(total)
+		return results, err
+	}
+
+	return search.PerformRawSearch(*apiClient, searchObj)
 }
 
 func logTotal(total int32) {

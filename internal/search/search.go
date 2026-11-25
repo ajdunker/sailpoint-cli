@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/log"
 	"github.com/mitchellh/mapstructure"
@@ -68,16 +69,22 @@ func BuildSearch(searchQuery string, sort []string, indices []string) (sailpoint
 }
 
 // ApplyIncludes limits the fields returned for every document by filling in
-// queryResultFilter.includes. It is a no-op when no fields are provided, so the
-// server keeps returning whole documents.
+// queryResultFilter.includes. It trims whitespace, ignores empty entries, and is a
+// no-op when no fields are provided so the server keeps returning whole documents.
 func ApplyIncludes(search *sailpointsdk.Search, includes []string) {
-	if len(includes) == 0 {
+	cleaned := make([]string, 0, len(includes))
+	for _, field := range includes {
+		if trimmed := strings.TrimSpace(field); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	if len(cleaned) == 0 {
 		return
 	}
 	if search.QueryResultFilter == nil {
 		search.QueryResultFilter = sailpointsdk.NewQueryresultfilter()
 	}
-	search.QueryResultFilter.SetIncludes(includes)
+	search.QueryResultFilter.SetIncludes(cleaned)
 }
 
 // ApplySearchAfter shifts the search window to start after the given sort values.
@@ -86,6 +93,55 @@ func ApplySearchAfter(search *sailpointsdk.Search, searchAfter []string) {
 		return
 	}
 	search.SearchAfter = searchAfter
+}
+
+// ensureStableSort returns a sort slice suitable for searchAfter paging: it defaults to
+// ["id"] when empty and appends "id" as a tie-breaker when no id sort is present.
+func ensureStableSort(sort []string) []string {
+	if len(sort) == 0 {
+		return []string{"id"}
+	}
+	result := make([]string, len(sort))
+	copy(result, sort)
+	for _, entry := range result {
+		if stripSortDirection(entry) == "id" {
+			return result
+		}
+	}
+	return append(result, "id")
+}
+
+// ensureSortFieldsIncluded adds any missing sort fields to queryResultFilter.includes so
+// searchAfter paging can always extract the cursor from the last document on each page.
+func ensureSortFieldsIncluded(search *sailpointsdk.Search) {
+	if search.QueryResultFilter == nil || len(search.QueryResultFilter.Includes) == 0 {
+		return
+	}
+	includes := make([]string, len(search.QueryResultFilter.Includes))
+	copy(includes, search.QueryResultFilter.Includes)
+	for _, entry := range search.Sort {
+		field := stripSortDirection(entry)
+		if field == "" || isFieldIncluded(includes, field) {
+			continue
+		}
+		includes = append(includes, field)
+	}
+	clone := *search.QueryResultFilter
+	clone.SetIncludes(includes)
+	search.QueryResultFilter = &clone
+}
+
+func isFieldIncluded(includes []string, field string) bool {
+	for _, inc := range includes {
+		if inc == field || strings.HasPrefix(field, inc+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func stripSortDirection(entry string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(entry), "+"), "-")
 }
 
 // decodeEntries converts the raw documents returned by the search endpoint into the
@@ -147,24 +203,35 @@ func decodeEntries(entries []map[string]interface{}, results *SearchResults) err
 	return nil
 }
 
-func PerformSearch(apiClient sailpoint.APIClient, search sailpointsdk.Search) (SearchResults, error) {
-	var SearchResults SearchResults
-
+func fetchSearchDefault(apiClient sailpoint.APIClient, search sailpointsdk.Search) ([]map[string]interface{}, error) {
 	ctx := context.TODO()
 	resp, r, err := sailpoint.PaginateWithDefaults[map[string]interface{}](apiClient.SearchAPI.SearchPostV1(ctx).Search(search))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+		return nil, newSearchError(r, err)
 	}
 
 	log.Debug("Search complete")
+	return resp, nil
+}
 
-	err = decodeEntries(resp, &SearchResults)
+func PerformSearch(apiClient sailpoint.APIClient, search sailpointsdk.Search) (SearchResults, error) {
+	var SearchResults SearchResults
+
+	resp, err := fetchSearchDefault(apiClient, search)
 	if err != nil {
 		return SearchResults, err
 	}
 
+	if err := decodeEntries(resp, &SearchResults); err != nil {
+		return SearchResults, err
+	}
+
 	return SearchResults, nil
+}
+
+// PerformRawSearch runs the default paginated search and returns the raw document maps.
+func PerformRawSearch(apiClient sailpoint.APIClient, search sailpointsdk.Search) ([]map[string]interface{}, error) {
+	return fetchSearchDefault(apiClient, search)
 }
 
 func PerformSearchWithLimit(apiClient sailpoint.APIClient, search sailpointsdk.Search, limit int32) (SearchResults, error) {
@@ -177,8 +244,7 @@ func PerformSearchWithLimit(apiClient sailpoint.APIClient, search sailpointsdk.S
 	ctx := context.TODO()
 	resp, r, err := apiClient.SearchAPI.SearchPostV1(ctx).Search(search).Limit(limit).Execute()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+		return SearchResults, newSearchError(r, err)
 	}
 
 	log.Debug("Search complete")
@@ -191,20 +257,15 @@ func PerformSearchWithLimit(apiClient sailpoint.APIClient, search sailpointsdk.S
 	return SearchResults, nil
 }
 
-// PerformSearchPage runs a single search request honouring limit and offset, and returns
-// the decoded results together with the total match count reported by the server. The
-// total is -1 when the server did not send an X-Total-Count header.
-func PerformSearchPage(apiClient sailpoint.APIClient, search sailpointsdk.Search, limit int32, offset int32) (SearchResults, int32, error) {
-	var SearchResults SearchResults
-
-	if limit == 0 {
+func fetchSearchPage(apiClient sailpoint.APIClient, search sailpointsdk.Search, limit int32, offset int32) ([]map[string]interface{}, int32, error) {
+	if limit <= 0 {
 		limit = DefaultPageSize
 	}
 
 	ctx := context.TODO()
 	resp, r, err := apiClient.SearchAPI.SearchPostV1(ctx).Search(search).Limit(limit).Offset(offset).Count(true).Execute()
 	if err != nil {
-		return SearchResults, -1, newSearchError(r, err)
+		return nil, -1, newSearchError(r, err)
 	}
 
 	log.Debug("Search complete", "limit", limit, "offset", offset)
@@ -216,6 +277,20 @@ func PerformSearchPage(apiClient sailpoint.APIClient, search sailpointsdk.Search
 		}
 	}
 
+	return resp, total, nil
+}
+
+// PerformSearchPage runs a single search request honouring limit and offset, and returns
+// the decoded results together with the total match count reported by the server. The
+// total is -1 when the server did not send an X-Total-Count header.
+func PerformSearchPage(apiClient sailpoint.APIClient, search sailpointsdk.Search, limit int32, offset int32) (SearchResults, int32, error) {
+	var SearchResults SearchResults
+
+	resp, total, err := fetchSearchPage(apiClient, search, limit, offset)
+	if err != nil {
+		return SearchResults, total, err
+	}
+
 	if err := decodeEntries(resp, &SearchResults); err != nil {
 		return SearchResults, total, err
 	}
@@ -223,22 +298,28 @@ func PerformSearchPage(apiClient sailpoint.APIClient, search sailpointsdk.Search
 	return SearchResults, total, nil
 }
 
-// PerformSearchAllPages walks a result set larger than the server page limit using
-// searchAfter paging, which is not bounded by the 10K offset limit. A stable sort field
-// is required, so the id field is used when no sort is given.
-func PerformSearchAllPages(apiClient sailpoint.APIClient, search sailpointsdk.Search) (SearchResults, int32, error) {
-	var SearchResults SearchResults
+// PerformRawSearchPage runs a single search request and returns the raw document maps.
+func PerformRawSearchPage(apiClient sailpoint.APIClient, search sailpointsdk.Search, limit int32, offset int32) ([]map[string]interface{}, int32, error) {
+	return fetchSearchPage(apiClient, search, limit, offset)
+}
 
-	if len(search.Sort) == 0 {
-		search.Sort = []string{"id"}
+func fetchSearchAllPages(apiClient sailpoint.APIClient, search sailpointsdk.Search, pageSize int32) ([]map[string]interface{}, int32, error) {
+	if pageSize <= 0 {
+		pageSize = DefaultPageSize
 	}
 
+	search.Sort = ensureStableSort(search.Sort)
+	ensureSortFieldsIncluded(&search)
+
+	var all []map[string]interface{}
 	total := int32(-1)
+	prevCursor := ""
+
 	for {
 		ctx := context.TODO()
-		resp, r, err := apiClient.SearchAPI.SearchPostV1(ctx).Search(search).Limit(DefaultPageSize).Count(total < 0).Execute()
+		resp, r, err := apiClient.SearchAPI.SearchPostV1(ctx).Search(search).Limit(pageSize).Count(total < 0).Execute()
 		if err != nil {
-			return SearchResults, total, newSearchError(r, err)
+			return all, total, newSearchError(r, err)
 		}
 
 		if r != nil && total < 0 {
@@ -247,26 +328,58 @@ func PerformSearchAllPages(apiClient sailpoint.APIClient, search sailpointsdk.Se
 			}
 		}
 
-		if err := decodeEntries(resp, &SearchResults); err != nil {
-			return SearchResults, total, err
-		}
+		all = append(all, resp...)
 
 		log.Debug("Page complete", "records", len(resp), "searchAfter", search.SearchAfter)
 
-		if len(resp) < int(DefaultPageSize) {
+		if len(resp) < int(pageSize) {
 			break
 		}
 
 		last := resp[len(resp)-1]
-		searchAfter := sortValues(last, search.Sort)
-		if len(searchAfter) == 0 || strings.Join(searchAfter, "\x00") == "" {
-			// Without sort values there is no stable cursor to continue from.
-			break
+		searchAfter, ok := sortValues(last, search.Sort)
+		if !ok {
+			return all, total, fmt.Errorf("cannot continue --page-all: last record on page is missing one or more sort fields (%s)", strings.Join(search.Sort, ", "))
 		}
+
+		cursorKey := strings.Join(searchAfter, "\x00")
+		if prevCursor != "" && cursorKey == prevCursor {
+			return all, total, fmt.Errorf("cannot continue --page-all: searchAfter cursor did not advance (%v)", searchAfter)
+		}
+		prevCursor = cursorKey
 		ApplySearchAfter(&search, searchAfter)
 	}
 
+	return all, total, nil
+}
+
+// PerformSearchAllPages walks a result set larger than the server page limit using
+// searchAfter paging with DefaultPageSize records per page.
+func PerformSearchAllPages(apiClient sailpoint.APIClient, search sailpointsdk.Search) (SearchResults, int32, error) {
+	return PerformSearchAllPagesWithLimit(apiClient, search, DefaultPageSize)
+}
+
+// PerformSearchAllPagesWithLimit walks a result set using searchAfter paging with the
+// given page size (defaulting to DefaultPageSize when pageSize <= 0).
+func PerformSearchAllPagesWithLimit(apiClient sailpoint.APIClient, search sailpointsdk.Search, pageSize int32) (SearchResults, int32, error) {
+	var SearchResults SearchResults
+
+	resp, total, err := fetchSearchAllPages(apiClient, search, pageSize)
+	if err != nil {
+		return SearchResults, total, err
+	}
+
+	if err := decodeEntries(resp, &SearchResults); err != nil {
+		return SearchResults, total, err
+	}
+
 	return SearchResults, total, nil
+}
+
+// PerformRawSearchAllPages walks all pages using searchAfter paging and returns the raw
+// document maps.
+func PerformRawSearchAllPages(apiClient sailpoint.APIClient, search sailpointsdk.Search, pageSize int32) ([]map[string]interface{}, int32, error) {
+	return fetchSearchAllPages(apiClient, search, pageSize)
 }
 
 // PerformCount returns the number of documents matching the search. It uses the
@@ -280,8 +393,10 @@ func PerformCount(apiClient sailpoint.APIClient, search sailpointsdk.Search) (in
 		if n, ok := totalCountFromResponse(r); ok {
 			return n, nil
 		}
-	} else if err != nil && r != nil && r.StatusCode != http.StatusNoContent {
-		return -1, newSearchError(r, err)
+	} else if err != nil {
+		if r == nil || (r.StatusCode != http.StatusNoContent && r.StatusCode != http.StatusNotFound && r.StatusCode != http.StatusMethodNotAllowed) {
+			return -1, newSearchError(r, err)
+		}
 	}
 
 	// Fall back to a minimal search, which populates X-Total-Count when count=true.
@@ -290,13 +405,13 @@ func PerformCount(apiClient sailpoint.APIClient, search sailpointsdk.Search) (in
 		return -1, newSearchError(r, err)
 	}
 	if r == nil {
-		return 0, nil
+		return -1, fmt.Errorf("the search count endpoint did not return a response")
 	}
 	if n, ok := totalCountFromResponse(r); ok {
 		return n, nil
 	}
 
-	return 0, fmt.Errorf("the search count endpoint did not return a total count")
+	return -1, fmt.Errorf("the search count endpoint did not return a total count")
 }
 
 // totalCountFromResponse reads the X-Total-Count header of a response.
@@ -330,20 +445,23 @@ func newSearchError(r *http.Response, err error) error {
 	return fmt.Errorf("search failed")
 }
 
-// sortValues returns the values of the sorted fields of a document, which is what the
+// sortValues returns the values of every sorted field of a document, which is what the
 // searchAfter parameter expects. Nested fields such as attributes.uid are supported.
-func sortValues(document map[string]interface{}, sort []string) []string {
+// Returns (nil, false) if any sort field is missing so a partial cursor is never sent.
+func sortValues(document map[string]interface{}, sort []string) ([]string, bool) {
+	if len(sort) == 0 {
+		return nil, false
+	}
 	values := make([]string, 0, len(sort))
 	for _, entry := range sort {
-		field := strings.TrimPrefix(strings.TrimPrefix(entry, "+"), "-")
+		field := stripSortDirection(entry)
 		value := fieldValue(document, field)
 		if value == "" {
-			// A missing value makes the cursor ambiguous, so stop paging.
-			return values
+			return nil, false
 		}
 		values = append(values, value)
 	}
-	return values
+	return values, true
 }
 
 // fieldValue walks a dotted field path in a decoded document and renders the value.
@@ -401,22 +519,22 @@ type resultGroup struct {
 func resultGroups(searchResults SearchResults) []resultGroup {
 	groups := make([]resultGroup, 0, 6)
 
-	if searchResults.AccountActivities != nil {
+	if len(searchResults.AccountActivities) > 0 {
 		groups = append(groups, resultGroup{index: "AccountActivities", value: searchResults.AccountActivities})
 	}
-	if searchResults.AccessProfiles != nil {
+	if len(searchResults.AccessProfiles) > 0 {
 		groups = append(groups, resultGroup{index: "AccessProfiles", value: searchResults.AccessProfiles})
 	}
-	if searchResults.Entitlements != nil {
+	if len(searchResults.Entitlements) > 0 {
 		groups = append(groups, resultGroup{index: "Entitlements", value: searchResults.Entitlements})
 	}
-	if searchResults.Events != nil {
+	if len(searchResults.Events) > 0 {
 		groups = append(groups, resultGroup{index: "Events", value: searchResults.Events})
 	}
-	if searchResults.Identities != nil {
+	if len(searchResults.Identities) > 0 {
 		groups = append(groups, resultGroup{index: "Identities", value: searchResults.Identities})
 	}
-	if searchResults.Roles != nil {
+	if len(searchResults.Roles) > 0 {
 		groups = append(groups, resultGroup{index: "Roles", value: searchResults.Roles})
 	}
 
@@ -425,42 +543,42 @@ func resultGroups(searchResults SearchResults) []resultGroup {
 
 func IterateIndices(SearchResults SearchResults, searchQuery string, folderPath string, outputTypes []string) error {
 	if len(SearchResults.AccountActivities) > 0 {
-		fileName := "query=" + searchQuery + "&indices=AccountActivities"
+		fileName := BuildResultFileName(searchQuery, "AccountActivities")
 		err := SaveResults(SearchResults.AccountActivities, fileName, folderPath, outputTypes)
 		if err != nil {
 			return err
 		}
 	}
 	if len(SearchResults.AccessProfiles) > 0 {
-		fileName := "query=" + searchQuery + "&indices=AccessProfiles"
+		fileName := BuildResultFileName(searchQuery, "AccessProfiles")
 		err := SaveResults(SearchResults.AccessProfiles, fileName, folderPath, outputTypes)
 		if err != nil {
 			return err
 		}
 	}
 	if len(SearchResults.Entitlements) > 0 {
-		fileName := "query=" + searchQuery + "&indices=Entitlements"
+		fileName := BuildResultFileName(searchQuery, "Entitlements")
 		err := SaveResults(SearchResults.Entitlements, fileName, folderPath, outputTypes)
 		if err != nil {
 			return err
 		}
 	}
 	if len(SearchResults.Events) > 0 {
-		fileName := "query=" + searchQuery + "&indices=Events"
+		fileName := BuildResultFileName(searchQuery, "Events")
 		err := SaveResults(SearchResults.Events, fileName, folderPath, outputTypes)
 		if err != nil {
 			return err
 		}
 	}
 	if len(SearchResults.Identities) > 0 {
-		fileName := "query=" + searchQuery + "&indices=Identities"
+		fileName := BuildResultFileName(searchQuery, "Identities")
 		err := SaveResults(SearchResults.Identities, fileName, folderPath, outputTypes)
 		if err != nil {
 			return err
 		}
 	}
 	if len(SearchResults.Roles) > 0 {
-		fileName := "query=" + searchQuery + "&indices=Roles"
+		fileName := BuildResultFileName(searchQuery, "Roles")
 		err := SaveResults(SearchResults.Roles, fileName, folderPath, outputTypes)
 		if err != nil {
 			return err
@@ -469,11 +587,22 @@ func IterateIndices(SearchResults SearchResults, searchQuery string, folderPath 
 	return nil
 }
 
+// normalizeFileName removes a trailing .json extension (case-insensitive) so a user
+// passing --file-name report.json gets report.json rather than reportjson.json.
+func normalizeFileName(fileName string) string {
+	trimmed := strings.TrimSpace(fileName)
+	if len(trimmed) >= 5 && strings.EqualFold(trimmed[len(trimmed)-5:], ".json") {
+		return trimmed[:len(trimmed)-5]
+	}
+	return trimmed
+}
+
 // WriteResults writes results using the provided options. Unlike IterateIndices it also
 // emits a value for an empty result set, so that scripts can tell "0 results" apart from
 // a failed run.
 func WriteResults(SearchResults SearchResults, searchQuery string, folderPath string, opts OutputOptions) error {
 	groups := resultGroups(SearchResults)
+	baseName := normalizeFileName(opts.FileName)
 
 	if opts.ToStdout {
 		var writer io.Writer = opts.Writer
@@ -492,7 +621,7 @@ func WriteResults(SearchResults SearchResults, searchQuery string, folderPath st
 	}
 
 	for _, group := range groups {
-		fileName := opts.FileName
+		fileName := baseName
 		if fileName == "" {
 			fileName = BuildResultFileName(searchQuery, group.index)
 		} else if len(groups) > 1 {
@@ -506,7 +635,7 @@ func WriteResults(SearchResults SearchResults, searchQuery string, folderPath st
 	// An empty result set still produces a file so that 0 results is not confused with
 	// a failed run.
 	if len(groups) == 0 {
-		fileName := opts.FileName
+		fileName := baseName
 		if fileName == "" {
 			fileName = BuildResultFileName(searchQuery, "Results")
 		}
@@ -516,8 +645,110 @@ func WriteResults(SearchResults SearchResults, searchQuery string, folderPath st
 	return nil
 }
 
+type rawResultGroup struct {
+	index   string
+	jsonKey string
+	entries []map[string]interface{}
+}
+
+func rawIndexNames(docType string) (string, string) {
+	switch docType {
+	case "accountactivity":
+		return "AccountActivities", "accountActivities"
+	case "accessprofile":
+		return "AccessProfiles", "accessProfiles"
+	case "entitlement":
+		return "Entitlements", "entitlements"
+	case "event":
+		return "Events", "events"
+	case "identity":
+		return "Identities", "identities"
+	case "role":
+		return "Roles", "roles"
+	case "":
+		return "Results", "results"
+	default:
+		return docType, docType
+	}
+}
+
+func groupRawEntries(entries []map[string]interface{}) []rawResultGroup {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	byIndex := make(map[string]*rawResultGroup)
+	order := make([]string, 0, 2)
+
+	for _, entry := range entries {
+		docType, _ := entry["_type"].(string)
+		indexName, jsonKey := rawIndexNames(docType)
+		g, ok := byIndex[indexName]
+		if !ok {
+			g = &rawResultGroup{index: indexName, jsonKey: jsonKey}
+			byIndex[indexName] = g
+			order = append(order, indexName)
+		}
+		g.entries = append(g.entries, entry)
+	}
+
+	groups := make([]rawResultGroup, 0, len(order))
+	for _, key := range order {
+		groups = append(groups, *byIndex[key])
+	}
+	return groups
+}
+
+// WriteRawResults writes raw document maps (used when --includes is set) so custom
+// attributes are preserved and omitted fields are not zero-filled.
+func WriteRawResults(entries []map[string]interface{}, searchQuery string, folderPath string, opts OutputOptions) error {
+	groups := groupRawEntries(entries)
+	baseName := normalizeFileName(opts.FileName)
+
+	if opts.ToStdout {
+		var writer io.Writer = opts.Writer
+		if writer == nil {
+			writer = os.Stdout
+		}
+		if len(groups) == 0 {
+			return writeJSON(writer, []interface{}{})
+		}
+		if len(groups) == 1 {
+			return writeJSON(writer, groups[0].entries)
+		}
+		payload := make(map[string][]map[string]interface{}, len(groups))
+		for _, group := range groups {
+			payload[group.jsonKey] = group.entries
+		}
+		return writeJSON(writer, payload)
+	}
+
+	if len(groups) == 0 {
+		fileName := baseName
+		if fileName == "" {
+			fileName = BuildResultFileName(searchQuery, "Results")
+		}
+		return SaveResults([]interface{}{}, fileName, folderPath, []string{"json"})
+	}
+
+	for _, group := range groups {
+		fileName := baseName
+		if fileName == "" {
+			fileName = BuildResultFileName(searchQuery, group.index)
+		} else if len(groups) > 1 {
+			fileName = fileName + "-" + group.index
+		}
+		if err := SaveResults(group.entries, fileName, folderPath, []string{"json"}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // BuildResultFileName builds a result file name that is safe for any filesystem by
-// truncating long query text and keeping a short hash of the full name.
+// truncating long query text on a UTF-8 rune boundary and keeping a short hash of the
+// full name.
 func BuildResultFileName(searchQuery string, index string) string {
 	name := "query=" + searchQuery + "&indices=" + index
 	if len(name) <= maxAutoFileNameLength {
@@ -530,7 +761,25 @@ func BuildResultFileName(searchQuery string, index string) string {
 		tail = tail[:8]
 	}
 
-	return name[:maxAutoFileNameLength-len(tail)-1] + "-" + tail
+	maxPrefixBytes := maxAutoFileNameLength - len(tail) - 1
+	prefix := truncateUTF8(name, maxPrefixBytes)
+	return prefix + "-" + tail
+}
+
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := 0
+	for i := 0; i < len(s); {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		if i+size > maxBytes {
+			break
+		}
+		i += size
+		cut = i
+	}
+	return s[:cut]
 }
 
 // writeJSON renders a value as indented JSON on the given writer.

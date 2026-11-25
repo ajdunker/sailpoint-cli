@@ -140,16 +140,17 @@ sail search query "attributes.cloudLifecycleState:active" --indices identities -
 
 #### Limit, Offset and Page All
 
-Use the `limit` and `offset` flags to request a single page of results. `limit` defaults to
-250 when it is set.
+Use the `limit` and `offset` flags to request a single page of results. When `offset` is set
+without `limit`, `limit` defaults to 250.
 
 ```shell
 sail search query "name:a*" --indices identities --limit 50 --offset 50 --stdout
 ```
 
 Use the `page-all` flag to follow every page until the whole result set is retrieved. It pages
-with `searchAfter`, so it is not capped at the first 10,000 records. A stable sort field is
-required, and `id` is used when no `sort` is given.
+with `searchAfter`, so it is not capped at the first 10,000 records. You can combine `page-all`
+with `limit` to tune the per-page size (default 250). A stable sort field is required: `id` is
+used when no `sort` is given, and appended as a tie-breaker when `sort` does not include `id`.
 
 ```shell
 sail search query "name:a*" --indices identities --page-all
