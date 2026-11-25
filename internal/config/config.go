@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -398,17 +399,13 @@ func GetConfig() (CLIConfig, error) {
 }
 
 func SaveConfig() error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-
-	folder := filepath.Join(home, configFolder)
-	if _, err := os.Stat(folder); os.IsNotExist(err) {
-		err = os.Mkdir(folder, 0777)
+	target := viper.ConfigFileUsed()
+	if target == "" {
+		home, err := os.UserHomeDir()
 		if err != nil {
-			log.Warn("failed to create %s folder for config. %v", configFolder, err)
+			return err
 		}
+		target = filepath.Join(home, configFolder, configYamlFile)
 	}
 
 	// AllSettings is the same value viper.WriteConfig marshals, so the file keeps its
@@ -418,7 +415,7 @@ func SaveConfig() error {
 		return err
 	}
 
-	return writeFileAtomically(filepath.Join(folder, "config.yaml"), data)
+	return writeFileAtomically(target, data)
 }
 
 // writeFileAtomically writes the data to a temporary file in the same folder and renames
@@ -426,7 +423,11 @@ func SaveConfig() error {
 // either see the whole previous file or the whole new one, never a truncated one.
 func writeFileAtomically(target string, data []byte) error {
 	folder := filepath.Dir(target)
+	if err := os.MkdirAll(folder, 0700); err != nil {
+		return err
+	}
 
+	// os.CreateTemp creates the file with mode 0600, keeping user config private.
 	temp, err := os.CreateTemp(folder, "config-*.yaml.tmp")
 	if err != nil {
 		return err
@@ -439,17 +440,48 @@ func writeFileAtomically(target string, data []byte) error {
 		return err
 	}
 
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		os.Remove(tempName)
+		return err
+	}
+
 	if err := temp.Close(); err != nil {
 		os.Remove(tempName)
 		return err
 	}
 
-	if err := os.Rename(tempName, target); err != nil {
+	if err := renameWithRetry(tempName, target); err != nil {
 		os.Remove(tempName)
 		return err
 	}
 
 	return nil
+}
+
+// renameWithRetry renames src over dst. On Windows, a concurrent reader or writer holding
+// dst open can transiently fail MoveFileExW with a sharing/access error, so retry briefly
+// with jittered backoff.
+func renameWithRetry(src string, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil || runtime.GOOS != "windows" {
+		return err
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	backoff := 2 * time.Millisecond
+	for time.Now().Before(deadline) {
+		jitter := time.Duration(time.Now().UnixNano()%int64(backoff)) + time.Millisecond
+		time.Sleep(backoff + jitter)
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		if backoff < 25*time.Millisecond {
+			backoff *= 2
+		}
+	}
+	return err
 }
 
 func TestSecretsStorage() bool {
