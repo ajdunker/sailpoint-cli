@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -32,13 +33,23 @@ func TestWriteFileAtomicallyOverwritesTheWholeFile(t *testing.T) {
 		t.Errorf("got %q, want the second document in full", got)
 	}
 
-	// The temporary file is renamed, so no leftovers are kept next to the config.
-	entries, err := os.ReadDir(folder)
+	info, err := os.Stat(target)
 	if err != nil {
-		t.Fatalf("unable to list the folder: %v", err)
+		t.Fatalf("stat config: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Errorf("got %d files, want only config.yaml", len(entries))
+	// Windows has no Unix permission model; Mode().Perm() only reflects the
+	// read-only bit, so exact-mode assertions cannot hold there.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		t.Errorf("mode = %o, want %o", info.Mode().Perm(), os.FileMode(0600))
+	}
+
+	// The temporary file is renamed, so no leftovers are kept next to the config.
+	matches, err := filepath.Glob(filepath.Join(folder, "."+filepath.Base(target)+".tmp-*"))
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("expected no leftover temp files, found: %v", matches)
 	}
 }
 
@@ -63,6 +74,7 @@ func TestSaveConfigRespectsConfigFileUsed(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("HOME", home)
+	t.Setenv("SAIL_BASE_URL", "")
 	resetViper(t)
 
 	folder := filepath.Join(home, ".sailpoint")
@@ -176,6 +188,7 @@ func TestSaveConfigMatchesTheViperFormat(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("HOME", home)
+	t.Setenv("SAIL_BASE_URL", "")
 	resetViper(t)
 
 	SetActiveEnvironment("alpha")

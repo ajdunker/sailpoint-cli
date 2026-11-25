@@ -424,38 +424,42 @@ func SaveConfig() error {
 func writeFileAtomically(target string, data []byte) error {
 	folder := filepath.Dir(target)
 	if err := os.MkdirAll(folder, 0700); err != nil {
-		return err
+		return fmt.Errorf("create config directory %s: %w", folder, err)
 	}
 
 	// os.CreateTemp creates the file with mode 0600, keeping user config private.
-	temp, err := os.CreateTemp(folder, "config-*.yaml.tmp")
+	temp, err := os.CreateTemp(folder, "."+filepath.Base(target)+".tmp-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("create temp file for %s: %w", filepath.Base(target), err)
 	}
+
 	tempName := temp.Name()
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = os.Remove(tempName)
+		}
+	}()
 
 	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		os.Remove(tempName)
-		return err
+		_ = temp.Close()
+		return fmt.Errorf("write temp file for %s: %w", filepath.Base(target), err)
 	}
 
 	if err := temp.Sync(); err != nil {
-		temp.Close()
-		os.Remove(tempName)
-		return err
+		_ = temp.Close()
+		return fmt.Errorf("sync temp file for %s: %w", filepath.Base(target), err)
 	}
 
 	if err := temp.Close(); err != nil {
-		os.Remove(tempName)
-		return err
+		return fmt.Errorf("close temp file for %s: %w", filepath.Base(target), err)
 	}
 
 	if err := renameWithRetry(tempName, target); err != nil {
-		os.Remove(tempName)
-		return err
+		return fmt.Errorf("replace %s: %w", filepath.Base(target), err)
 	}
 
+	succeeded = true
 	return nil
 }
 
