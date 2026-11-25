@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/viper"
 	keyring "github.com/zalando/go-keyring"
 	"gopkg.in/square/go-jose.v2/jwt"
+	"gopkg.in/yaml.v3"
 )
 
 var ErrAccessTokenExpired = fmt.Errorf("accesstoken is expired")
@@ -397,30 +399,93 @@ func GetConfig() (CLIConfig, error) {
 }
 
 func SaveConfig() error {
-	home, err := os.UserHomeDir()
+	target := viper.ConfigFileUsed()
+	if target == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		target = filepath.Join(home, configFolder, configYamlFile)
+	}
+
+	// AllSettings is the same value viper.WriteConfig marshals, so the file keeps its
+	// shape while the write itself becomes atomic.
+	data, err := yaml.Marshal(viper.AllSettings())
 	if err != nil {
 		return err
 	}
 
-	if _, err := os.Stat(filepath.Join(home, configFolder)); os.IsNotExist(err) {
-		err = os.Mkdir(filepath.Join(home, configFolder), 0777)
-		if err != nil {
-			log.Warn("failed to create %s folder for config. %v", configFolder, err)
-		}
+	return writeFileAtomically(target, data)
+}
+
+// writeFileAtomically writes the data to a temporary file in the same folder and renames
+// it over the target. A rename inside one folder is atomic, so parallel CLI invocations
+// either see the whole previous file or the whole new one, never a truncated one.
+func writeFileAtomically(target string, data []byte) error {
+	folder := filepath.Dir(target)
+	if err := os.MkdirAll(folder, 0700); err != nil {
+		return fmt.Errorf("create config directory %s: %w", folder, err)
 	}
 
-	err = viper.WriteConfig()
+	// os.CreateTemp creates the file with mode 0600, keeping user config private.
+	temp, err := os.CreateTemp(folder, "."+filepath.Base(target)+".tmp-*")
 	if err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			err = viper.SafeWriteConfig()
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
+		return fmt.Errorf("create temp file for %s: %w", filepath.Base(target), err)
+	}
+
+	tempName := temp.Name()
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = os.Remove(tempName)
+		}
+	}()
+
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write temp file for %s: %w", filepath.Base(target), err)
+	}
+
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("sync temp file for %s: %w", filepath.Base(target), err)
+	}
+
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close temp file for %s: %w", filepath.Base(target), err)
+	}
+
+	if err := renameWithRetry(tempName, target); err != nil {
+		return fmt.Errorf("replace %s: %w", filepath.Base(target), err)
+	}
+
+	succeeded = true
+	return nil
+}
+
+// renameWithRetry renames src over dst. On Windows, a concurrent reader or writer holding
+// dst open can transiently fail MoveFileExW with a sharing/access error, so retry briefly
+// with jittered backoff.
+func renameWithRetry(src string, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil || runtime.GOOS != "windows" {
+		return err
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	backoff := 2 * time.Millisecond
+	for time.Now().Before(deadline) {
+		jitter := time.Duration(time.Now().UnixNano()%int64(backoff)) + time.Millisecond
+		time.Sleep(backoff + jitter)
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		if backoff < 25*time.Millisecond {
+			backoff *= 2
 		}
 	}
-	return nil
+	return err
 }
 
 func TestSecretsStorage() bool {
