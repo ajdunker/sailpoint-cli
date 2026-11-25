@@ -12,6 +12,10 @@ The `search` command makes it easy to search in SailPoint Identity Security with
       - [Sort](#sort)
       - [Output Types](#output-types)
       - [Folder Path](#folder-path)
+      - [Count](#count)
+      - [Includes](#includes)
+      - [Limit, Offset and Page All](#limit-offset-and-page-all)
+      - [Output Destination](#output-destination)
   - [Template](#template)
     - [Command](#command-1)
     - [Flags](#flags-1)
@@ -52,6 +56,10 @@ You can append a number of flags to the `query` command to refine it:
 - The second possible flag, `sort`, allows you to specify the sort strings to use for the search query, as well as the sorting arrangement for the results. 
 - The third possible flag, `outputTypes`, allows you to specify the output data format as either `json` or `csv`. 
 - The fourth possible flag, `folderPath`, allows you to specify the folder path where you want to save the search query result files. 
+- The `count` flag prints only the number of matches. 
+- The `includes` flag trims each document down to the listed fields. 
+- The `limit` and `offset` flags request a single page, and `page-all` follows every page. 
+- The `stdout` and `file-name` flags control where the JSON is written. 
  
 #### Indices
 
@@ -109,6 +117,60 @@ Here is an example of a `query` command that specifies a `folderPath`:
 
 ```shell
 sail search query "name:a*" --indices identities --folderPath ./local/folder/path
+```
+
+#### Count
+
+Use the `count` flag when you only need to know how many documents match. It prints a single
+number on stdout and writes no file, so a large result set never exceeds the response limit.
+
+```shell
+sail search query "attributes.cloudLifecycleState:active" --indices identities --count
+```
+
+#### Includes
+
+Use the `includes` flag to trim each document down to the fields you need. Only the listed
+fields are returned instead of whole documents, which keeps the response small enough to be
+returned in one page.
+
+```shell
+sail search query "attributes.cloudLifecycleState:active" --indices identities --includes id,name,attributes.uid
+```
+
+#### Limit, Offset and Page All
+
+Use the `limit` and `offset` flags to request a single page of results. When `offset` is set
+without `limit`, `limit` defaults to 250.
+
+```shell
+sail search query "name:a*" --indices identities --limit 50 --offset 50 --stdout
+```
+
+Use the `page-all` flag to follow every page until the whole result set is retrieved. It pages
+with `searchAfter`, so it is not capped at the first 10,000 records. You can combine `page-all`
+with `limit` to tune the per-page size (default 250). A stable sort field is required: `id` is
+used when no `sort` is given, and appended as a tie-breaker when `sort` does not include `id`.
+
+```shell
+sail search query "name:a*" --indices identities --page-all
+```
+
+#### Output Destination
+
+Use the `stdout` flag to print the JSON instead of writing a file, which avoids creating a
+temporary folder for a quick check. A query with no matches prints `[]`.
+
+```shell
+sail search query "name:a*" --indices identities --includes id,name --limit 50 --stdout
+```
+
+Use the `file-name` flag to choose the name of the result file, without its extension. When it
+is not set, the name is derived from the query and shortened to a fixed length with a hash of
+the full query appended.
+
+```shell
+sail search query "name:a*" --indices identities --file-name identities-starting-with-a
 ```
 
 ## Template

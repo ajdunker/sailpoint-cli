@@ -1,12 +1,12 @@
 package search
 
 type SearchResults struct {
-	AccountActivities []AccountActivity
-	AccessProfiles    []AccessProfile
-	Entitlements      []Entitlement
-	Events            []Event
-	Identities        []Identity
-	Roles             []Role
+	AccountActivities []AccountActivity `json:"accountActivities,omitempty"`
+	AccessProfiles    []AccessProfile   `json:"accessProfiles,omitempty"`
+	Entitlements      []Entitlement     `json:"entitlements,omitempty"`
+	Events            []Event           `json:"events,omitempty"`
+	Identities        []Identity        `json:"identities,omitempty"`
+	Roles             []Role            `json:"roles,omitempty"`
 }
 
 type AccessProfile struct {
