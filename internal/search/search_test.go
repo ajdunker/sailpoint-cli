@@ -1,5 +1,3 @@
-// Copyright (c) 2021, SailPoint Technologies, Inc. All rights reserved.
-
 package search
 
 import (
@@ -8,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,9 +23,10 @@ func newTestAPIClient(t *testing.T, baseURL string) sailpoint.APIClient {
 		BaseURL: baseURL,
 	})
 	client := sailpoint.NewAPIClient(cfg)
-	// Disable retries in tests so failure paths execute once and fail fast.
+	// Disable retries and retryablehttp debug logging so tests fail fast and stay quiet in CI.
 	if cfg.HTTPClient != nil {
 		cfg.HTTPClient.RetryMax = 0
+		cfg.HTTPClient.Logger = nil
 	}
 	return *client
 }
@@ -528,11 +528,11 @@ func TestPerformSearchPageHonoursLimitOffsetAndCount(t *testing.T) {
 }
 
 func TestPerformRawSearchAllPagesUsesCustomLimitTieBreakerAndIncludesSortFields(t *testing.T) {
-	var page int
+	var page atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		page++
+		currentPage := page.Add(1)
 		if r.URL.Query().Get("limit") != "2" {
-			t.Errorf("page %d: expected limit=2, got %s", page, r.URL.Query().Get("limit"))
+			t.Errorf("page %d: expected limit=2, got %s", currentPage, r.URL.Query().Get("limit"))
 		}
 
 		var body map[string]interface{}
@@ -543,7 +543,7 @@ func TestPerformRawSearchAllPagesUsesCustomLimitTieBreakerAndIncludesSortFields(
 		// Verify id tie-breaker was appended to sort and sort fields were added to includes.
 		sortSlice, _ := body["sort"].([]interface{})
 		if len(sortSlice) != 2 || sortSlice[0] != "name" || sortSlice[1] != "id" {
-			t.Errorf("page %d: expected sort=[name id], got %v", page, sortSlice)
+			t.Errorf("page %d: expected sort=[name id], got %v", currentPage, sortSlice)
 		}
 		qrf, _ := body["queryResultFilter"].(map[string]interface{})
 		incSlice, _ := qrf["includes"].([]interface{})
@@ -552,11 +552,11 @@ func TestPerformRawSearchAllPagesUsesCustomLimitTieBreakerAndIncludesSortFields(
 			incJoined += v.(string) + ","
 		}
 		if !strings.Contains(incJoined, "name,") || !strings.Contains(incJoined, "id,") {
-			t.Errorf("page %d: expected sort fields in includes, got %v", page, incSlice)
+			t.Errorf("page %d: expected sort fields in includes, got %v", currentPage, incSlice)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		if page == 1 {
+		if currentPage == 1 {
 			w.Header().Set("X-Total-Count", "3")
 			_, _ = w.Write([]byte(`[{"_type":"identity","id":"1","name":"Alice"},{"_type":"identity","id":"2","name":"Bob"}]`))
 			return
@@ -634,7 +634,7 @@ func runWriteResults(t *testing.T, results SearchResults, opts OutputOptions) st
 }
 
 func readFile(folder string, name string) (string, error) {
-	data, err := os.ReadFile(folder + string(os.PathSeparator) + name)
+	data, err := os.ReadFile(filepath.Join(folder, name))
 	if err != nil {
 		return "", err
 	}

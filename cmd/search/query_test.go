@@ -83,47 +83,55 @@ func TestValidateQueryFlagsRejectsNegativeLimitAndOffset(t *testing.T) {
 }
 
 func TestValidateQueryFlagsRejectsConflictingCombinations(t *testing.T) {
-	cmd := newQueryCmd()
-	if err := cmd.Flags().Set("page-all", "true"); err != nil {
-		t.Fatalf("unable to set --page-all: %v", err)
-	}
-	if err := cmd.Flags().Set("offset", "10"); err != nil {
-		t.Fatalf("unable to set --offset: %v", err)
-	}
-	if err := validateQueryFlags(cmd, false, true, 0, 10); err == nil {
-		t.Error("expected an error when combining --page-all with --offset")
-	}
+	t.Run("page-all with offset", func(t *testing.T) {
+		cmd := newQueryCmd()
+		if err := cmd.Flags().Set("page-all", "true"); err != nil {
+			t.Fatalf("unable to set --page-all: %v", err)
+		}
+		if err := cmd.Flags().Set("offset", "10"); err != nil {
+			t.Fatalf("unable to set --offset: %v", err)
+		}
+		if err := validateQueryFlags(cmd, false, true, 0, 10); err == nil {
+			t.Error("expected an error when combining --page-all with --offset")
+		}
+	})
 
-	for _, conflict := range []struct {
+	tests := []struct {
 		name  string
+		flag  string
 		value string
 	}{
-		{"page-all", "true"},
-		{"limit", "10"},
-		{"offset", "5"},
-		{"file-name", "out"},
-	} {
-		cmd = newQueryCmd()
+		{name: "count with page-all", flag: "page-all", value: "true"},
+		{name: "count with limit", flag: "limit", value: "10"},
+		{name: "count with offset", flag: "offset", value: "5"},
+		{name: "count with file-name", flag: "file-name", value: "out"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := newQueryCmd()
+			if err := cmd.Flags().Set("count", "true"); err != nil {
+				t.Fatalf("unable to set --count: %v", err)
+			}
+			if err := cmd.Flags().Set(tt.flag, tt.value); err != nil {
+				t.Fatalf("unable to set --%s: %v", tt.flag, err)
+			}
+			if err := validateQueryFlags(cmd, true, tt.flag == "page-all", 10, 5); err == nil {
+				t.Errorf("expected an error when combining --count with --%s", tt.flag)
+			}
+		})
+	}
+
+	t.Run("count with stdout is allowed", func(t *testing.T) {
+		cmd := newQueryCmd()
 		if err := cmd.Flags().Set("count", "true"); err != nil {
 			t.Fatalf("unable to set --count: %v", err)
 		}
-		if err := cmd.Flags().Set(conflict.name, conflict.value); err != nil {
-			t.Fatalf("unable to set --%s: %v", conflict.name, err)
+		if err := cmd.Flags().Set("stdout", "true"); err != nil {
+			t.Fatalf("unable to set --stdout: %v", err)
 		}
-		if err := validateQueryFlags(cmd, true, conflict.name == "page-all", 10, 5); err == nil {
-			t.Errorf("expected an error when combining --count with --%s", conflict.name)
+		if err := validateQueryFlags(cmd, true, false, 0, 0); err != nil {
+			t.Errorf("expected --count --stdout to be allowed, got %v", err)
 		}
-	}
-
-	// --count with --stdout is harmless and allowed.
-	cmd = newQueryCmd()
-	if err := cmd.Flags().Set("count", "true"); err != nil {
-		t.Fatalf("unable to set --count: %v", err)
-	}
-	if err := cmd.Flags().Set("stdout", "true"); err != nil {
-		t.Fatalf("unable to set --stdout: %v", err)
-	}
-	if err := validateQueryFlags(cmd, true, false, 0, 0); err != nil {
-		t.Errorf("expected --count --stdout to be allowed, got %v", err)
-	}
+	})
 }
